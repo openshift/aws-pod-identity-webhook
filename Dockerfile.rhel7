@@ -1,0 +1,8 @@
+FROM registry.svc.ci.openshift.org/ocp/builder:golang-1.13 AS builder
+WORKDIR /go/src/github.com/aws/amazon-eks-pod-identity-webhook
+COPY . .
+ENV GO_PACKAGE github.com/aws/amazon-eks-pod-identity-webhook
+RUN make amazon-eks-pod-identity-webhook
+
+FROM registry.svc.ci.openshift.org/ocp/4.5:base
+COPY --from=builder /go/src/github.com/aws/amazon-eks-pod-identity-webhook/amazon-eks-pod-identity-webhook /usr/bin/aws-pod-identity-webhook
