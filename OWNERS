@@ -2,3 +2,4 @@ reviewers:
   - sjenning
 approvers:
   - sjenning
+component: "Cloud Credential Operator"
