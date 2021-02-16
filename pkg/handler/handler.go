@@ -16,13 +16,16 @@
 package handler
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/aws/amazon-eks-pod-identity-webhook/pkg"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/cache"
 	"k8s.io/api/admission/v1beta1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
@@ -31,13 +34,39 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/apis/core/v1"
 )
+
+type podUpdateSettings struct {
+	skipContainers map[string]bool
+	useRegionalSTS bool
+}
+
+// newPodUpdateSettings returns the update settings for a particular pod
+func newPodUpdateSettings(annotationDomain string, pod *corev1.Pod, useRegionalSTS bool) *podUpdateSettings {
+	settings := &podUpdateSettings{
+		useRegionalSTS: useRegionalSTS,
+	}
+
+	skippedNames := map[string]bool{}
+	skipContainersKey := annotationDomain + "/" + pkg.SkipContainersAnnotation
+	if value, ok := pod.Annotations[skipContainersKey]; ok {
+		r := csv.NewReader(strings.NewReader(value))
+		// error means we don't skip any
+		podNames, err := r.Read()
+		if err != nil {
+			klog.Infof("Could parse skip containers annotation on pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		}
+		for _, name := range podNames {
+			skippedNames[name] = true
+		}
+	}
+	settings.skipContainers = skippedNames
+	return settings
+}
 
 func init() {
 	_ = corev1.AddToScheme(runtimeScheme)
 	_ = admissionregistrationv1beta1.AddToScheme(runtimeScheme)
-	_ = v1.AddToScheme(runtimeScheme)
 }
 
 var (
@@ -69,14 +98,25 @@ func WithRegion(region string) ModifierOpt {
 	return func(m *Modifier) { m.Region = region }
 }
 
+// WithRegionalSTS sets the modifier RegionalSTSEndpoint
+func WithRegionalSTS(enabled bool) ModifierOpt {
+	return func(m *Modifier) { m.RegionalSTSEndpoint = enabled }
+}
+
+// WithAnnotationDomain adds an annotation domain
+func WithAnnotationDomain(domain string) ModifierOpt {
+	return func(m *Modifier) { m.AnnotationDomain = domain }
+}
+
 // NewModifier returns a Modifier with default values
 func NewModifier(opts ...ModifierOpt) *Modifier {
-
 	mod := &Modifier{
-		MountPath:  "/var/run/secrets/eks.amazonaws.com/serviceaccount",
-		Expiration: 86400,
-		volName:    "aws-iam-token",
-		tokenName:  "token",
+		AnnotationDomain:    "eks.amazonaws.com",
+		MountPath:           "/var/run/secrets/eks.amazonaws.com/serviceaccount",
+		Expiration:          86400,
+		RegionalSTSEndpoint: false,
+		volName:             "aws-iam-token",
+		tokenName:           "token",
 	}
 	for _, opt := range opts {
 		opt(mod)
@@ -87,12 +127,14 @@ func NewModifier(opts ...ModifierOpt) *Modifier {
 
 // Modifier holds configuration values for pod modifications
 type Modifier struct {
-	Expiration int64
-	MountPath  string
-	Region     string
-	Cache      cache.ServiceAccountCache
-	volName    string
-	tokenName  string
+	AnnotationDomain    string
+	Expiration          int64
+	MountPath           string
+	Region              string
+	RegionalSTSEndpoint bool
+	Cache               cache.ServiceAccountCache
+	volName             string
+	tokenName           string
 }
 
 type patchOperation struct {
@@ -101,56 +143,87 @@ type patchOperation struct {
 	Value interface{} `json:"value,omitempty"`
 }
 
-func addEnvToContainer(container *corev1.Container, mountPath, tokenFilePath, volName, roleName, region string) {
-	var skipReservedKeys, skipRegionKey bool
+func logContext(podName, podGenerateName, serviceAccountName, namespace string) string {
+	name := podName
+	if len(podName) == 0 {
+		name = podGenerateName
+	}
+	return fmt.Sprintf("Pod=%s, "+
+		"ServiceAccount=%s, "+
+		"Namespace=%s",
+		name,
+		serviceAccountName,
+		namespace)
+}
+
+func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath, roleName string, podSettings *podUpdateSettings) bool {
+	// return if this is a named skipped container
+	if _, ok := podSettings.skipContainers[container.Name]; ok {
+		klog.V(4).Infof("Container %s was annotated to be skipped", container.Name)
+		return false
+	}
+
+	var (
+		reservedKeysDefined   bool
+		regionKeyDefined      bool
+		regionalStsKeyDefined bool
+	)
 	reservedKeys := map[string]string{
 		"AWS_ROLE_ARN":                "",
 		"AWS_WEB_IDENTITY_TOKEN_FILE": "",
 	}
-	for _, env := range container.Env {
-		if _, ok := reservedKeys[env.Name]; ok {
-			// Skip if any env vars are already present
-			skipReservedKeys = true
-		}
-	}
-
-	for _, vol := range container.VolumeMounts {
-		if vol.Name == volName {
-			// Skip if volume is already present
-			skipReservedKeys = true
-		}
-	}
-
 	awsRegionKeys := map[string]string{
 		"AWS_REGION":         "",
 		"AWS_DEFAULT_REGION": "",
 	}
+	stsKey := "AWS_STS_REGIONAL_ENDPOINTS"
 	for _, env := range container.Env {
+		if _, ok := reservedKeys[env.Name]; ok {
+			reservedKeysDefined = true
+		}
 		if _, ok := awsRegionKeys[env.Name]; ok {
-			// Don't set AWS_DEFAULT_REGION if any awsRegionKeys is already set
-			skipRegionKey = true
+			// Don't set both region keys if any region key is already set
+			regionKeyDefined = true
+		}
+		if env.Name == stsKey {
+			regionalStsKeyDefined = true
 		}
 	}
 
-	if skipReservedKeys && skipRegionKey {
-		return
+	if reservedKeysDefined && regionKeyDefined && regionalStsKeyDefined {
+		klog.V(4).Infof("Container %s has necessary env variables already present",
+			container.Name)
+		return false
 	}
 
+	changed := false
 	env := container.Env
-	if !skipRegionKey && region != "" {
+
+	if !regionalStsKeyDefined && m.RegionalSTSEndpoint && podSettings.useRegionalSTS {
+		env = append(env,
+			corev1.EnvVar{
+				Name:  stsKey,
+				Value: "regional",
+			},
+		)
+		changed = true
+	}
+
+	if !regionKeyDefined && m.Region != "" {
 		env = append(env,
 			corev1.EnvVar{
 				Name:  "AWS_DEFAULT_REGION",
-				Value: region,
+				Value: m.Region,
 			},
 			corev1.EnvVar{
 				Name:  "AWS_REGION",
-				Value: region,
+				Value: m.Region,
 			},
 		)
+		changed = true
 	}
 
-	if !skipReservedKeys {
+	if !reservedKeysDefined {
 		env = append(env, corev1.EnvVar{
 			Name:  "AWS_ROLE_ARN",
 			Value: roleName,
@@ -160,26 +233,34 @@ func addEnvToContainer(container *corev1.Container, mountPath, tokenFilePath, vo
 			Name:  "AWS_WEB_IDENTITY_TOKEN_FILE",
 			Value: tokenFilePath,
 		})
+		changed = true
 	}
 
 	container.Env = env
-	container.VolumeMounts = append(
-		container.VolumeMounts,
-		corev1.VolumeMount{
-			Name:      volName,
-			ReadOnly:  true,
-			MountPath: mountPath,
-		},
-	)
-}
 
-func (m *Modifier) updatePodSpec(pod *corev1.Pod, roleName, audience string) []patchOperation {
-	// return early if volume already exists
-	for _, vol := range pod.Spec.Volumes {
+	volExists := false
+	for _, vol := range container.VolumeMounts {
 		if vol.Name == m.volName {
-			return nil
+			volExists = true
 		}
 	}
+
+	if !volExists {
+		container.VolumeMounts = append(
+			container.VolumeMounts,
+			corev1.VolumeMount{
+				Name:      m.volName,
+				ReadOnly:  true,
+				MountPath: m.MountPath,
+			},
+		)
+		changed = true
+	}
+	return changed
+}
+
+func (m *Modifier) updatePodSpec(pod *corev1.Pod, roleName, audience string, regionalSTS bool, tokenExpiration int64) ([]patchOperation, bool) {
+	updateSettings := newPodUpdateSettings(m.AnnotationDomain, pod, regionalSTS)
 
 	tokenFilePath := filepath.Join(m.MountPath, m.tokenName)
 
@@ -192,28 +273,38 @@ func (m *Modifier) updatePodSpec(pod *corev1.Pod, roleName, audience string) []p
 		tokenFilePath = "C:" + strings.Replace(tokenFilePath, `/`, `\`, -1)
 	}
 
+	var changed bool
 	var initContainers = []corev1.Container{}
 	for i := range pod.Spec.InitContainers {
 		container := pod.Spec.InitContainers[i]
-		addEnvToContainer(&container, m.MountPath, tokenFilePath, m.volName, roleName, m.Region)
+		changed = m.addEnvToContainer(&container, tokenFilePath, roleName, updateSettings)
 		initContainers = append(initContainers, container)
 	}
 	var containers = []corev1.Container{}
 	for i := range pod.Spec.Containers {
 		container := pod.Spec.Containers[i]
-		addEnvToContainer(&container, m.MountPath, tokenFilePath, m.volName, roleName, m.Region)
+		changed = m.addEnvToContainer(&container, tokenFilePath, roleName, updateSettings)
 		containers = append(containers, container)
 	}
 
+	expirationKey := m.AnnotationDomain + "/" + pkg.TokenExpirationAnnotation
+	if expirationStr, ok := pod.Annotations[expirationKey]; ok {
+		if expiration, err := strconv.ParseInt(expirationStr, 10, 64); err != nil {
+			klog.V(4).Infof("Found invalid value for token expiration, using %d seconds as default: %v", tokenExpiration, err)
+		} else {
+			tokenExpiration = pkg.ValidateMinTokenExpiration(expiration)
+		}
+	}
+
 	volume := corev1.Volume{
-		m.volName,
-		corev1.VolumeSource{
+		Name: m.volName,
+		VolumeSource: corev1.VolumeSource{
 			Projected: &corev1.ProjectedVolumeSource{
 				Sources: []corev1.VolumeProjection{
-					corev1.VolumeProjection{
+					{
 						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 							Audience:          audience,
-							ExpirationSeconds: &m.Expiration,
+							ExpirationSeconds: &tokenExpiration,
 							Path:              m.tokenName,
 						},
 					},
@@ -222,24 +313,35 @@ func (m *Modifier) updatePodSpec(pod *corev1.Pod, roleName, audience string) []p
 		},
 	}
 
-	patch := []patchOperation{
-		patchOperation{
+	patch := []patchOperation{}
+
+	// skip adding volume if it already exists
+	volExists := false
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name == m.volName {
+			volExists = true
+		}
+	}
+
+	if !volExists {
+		volPatch := patchOperation{
 			Op:    "add",
 			Path:  "/spec/volumes/0",
 			Value: volume,
-		},
-	}
+		}
 
-	if pod.Spec.Volumes == nil {
-		patch = []patchOperation{
-			patchOperation{
+		if pod.Spec.Volumes == nil {
+			volPatch = patchOperation{
 				Op:   "add",
 				Path: "/spec/volumes",
 				Value: []corev1.Volume{
 					volume,
 				},
-			},
+			}
 		}
+
+		patch = append(patch, volPatch)
+		changed = true
 	}
 
 	patch = append(patch, patchOperation{
@@ -255,7 +357,7 @@ func (m *Modifier) updatePodSpec(pod *corev1.Pod, roleName, audience string) []p
 			Value: initContainers,
 		})
 	}
-	return patch
+	return patch, changed
 }
 
 // MutatePod takes a AdmissionReview, mutates the pod, and returns an AdmissionResponse
@@ -286,16 +388,23 @@ func (m *Modifier) MutatePod(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResp
 
 	pod.Namespace = req.Namespace
 
-	podRole, audience := m.Cache.Get(pod.Spec.ServiceAccountName, pod.Namespace)
+	podRole, audience, regionalSTS, tokenExpiration := m.Cache.Get(pod.Spec.ServiceAccountName, pod.Namespace)
 
 	// determine whether to perform mutation
 	if podRole == "" {
+		klog.V(4).Infof("Pod was not mutated. Reason: "+
+			"Service account did not have the right annotations or was not found in the cache. %s",
+			logContext(pod.Name,
+				pod.GenerateName,
+				pod.Spec.ServiceAccountName,
+				pod.Namespace))
 		return &v1beta1.AdmissionResponse{
 			Allowed: true,
 		}
 	}
 
-	patchBytes, err := json.Marshal(m.updatePodSpec(&pod, podRole, audience))
+	patch, changed := m.updatePodSpec(&pod, podRole, audience, regionalSTS, tokenExpiration)
+	patchBytes, err := json.Marshal(patch)
 	if err != nil {
 		klog.Errorf("Error marshaling pod update: %v", err.Error())
 		return &v1beta1.AdmissionResponse{
@@ -303,6 +412,16 @@ func (m *Modifier) MutatePod(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResp
 				Message: err.Error(),
 			},
 		}
+	}
+
+	// TODO: klog structured logging can make this better
+	if changed {
+		klog.V(3).Infof("Pod was mutated. %s",
+			logContext(pod.Name, pod.GenerateName, pod.Spec.ServiceAccountName, pod.Namespace))
+	} else {
+		klog.V(3).Infof("Pod was not mutated. Reason: "+
+			"Required volume mounts and env variables were already present. %s",
+			logContext(pod.Name, pod.GenerateName, pod.Spec.ServiceAccountName, pod.Namespace))
 	}
 
 	return &v1beta1.AdmissionResponse{
@@ -323,17 +442,12 @@ func (m *Modifier) Handle(w http.ResponseWriter, r *http.Request) {
 			body = data
 		}
 	}
-	if len(body) == 0 {
-		klog.Errorf("empty body")
-		http.Error(w, "empty body", http.StatusBadRequest)
-		return
-	}
 
 	// verify the content type is accurate
 	contentType := r.Header.Get("Content-Type")
 	if contentType != "application/json" {
-		klog.Errorf("Content-Type=%s, expect application/json", contentType)
-		http.Error(w, "invalid Content-Type, expect `application/json`", http.StatusUnsupportedMediaType)
+		klog.Errorf("Content-Type=%s, expected application/json", contentType)
+		http.Error(w, "Invalid Content-Type, expected `application/json`", http.StatusUnsupportedMediaType)
 		return
 	}
 
