@@ -25,7 +25,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/aws/amazon-eks-pod-identity-webhook/pkg"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/cache"
+	cachedebug "github.com/aws/amazon-eks-pod-identity-webhook/pkg/cache/debug"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/cert"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/handler"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -48,7 +50,7 @@ func main() {
 	kubeconfig := flag.String("kubeconfig", "", "(out-of-cluster) Absolute path to the API server kubeconfig file")
 	apiURL := flag.String("kube-api", "", "(out-of-cluster) The url to the API server")
 	tlsKeyFile := flag.String("tls-key", "/etc/webhook/certs/tls.key", "(out-of-cluster) TLS key file path")
-	tlsCertFile := flag.String("tls-cert", "/etc/webhook/certs/tls.cert", "(out-of-cluster) TLS certificate file path")
+	tlsCertFile := flag.String("tls-cert", "/etc/webhook/certs/tls.crt", "(out-of-cluster) TLS certificate file path")
 
 	// in-cluster TLS options
 	inCluster := flag.Bool("in-cluster", true, "Use in-cluster authentication and certificate request API")
@@ -60,10 +62,13 @@ func main() {
 	annotationPrefix := flag.String("annotation-prefix", "eks.amazonaws.com", "The Service Account annotation to look for")
 	audience := flag.String("token-audience", "sts.amazonaws.com", "The default audience for tokens. Can be overridden by annotation")
 	mountPath := flag.String("token-mount-path", "/var/run/secrets/eks.amazonaws.com/serviceaccount", "The path to mount tokens")
-	tokenExpiration := flag.Int64("token-expiration", 86400, "The token expiration")
+	tokenExpiration := flag.Int64("token-expiration", pkg.DefaultTokenExpiration, "The token expiration")
 	region := flag.String("aws-default-region", "", "If set, AWS_DEFAULT_REGION and AWS_REGION will be set to this value in mutated containers")
+	regionalSTS := flag.Bool("sts-regional-endpoint", false, "Whether to inject the AWS_STS_REGIONAL_ENDPOINTS=regional env var in mutated pods. Defaults to `false`.")
 
 	version := flag.Bool("version", false, "Display the version and exit")
+
+	debug := flag.Bool("enable-debugging-handlers", false, "Enable debugging handlers. Currently /debug/alpha/cache is supported")
 
 	klog.InitFlags(goflag.CommandLine)
 	// Add klog CommandLine flags to pflag CommandLine
@@ -93,18 +98,23 @@ func main() {
 		klog.Fatalf("Error creating clientset: %v", err.Error())
 	}
 
+	*tokenExpiration = pkg.ValidateMinTokenExpiration(*tokenExpiration)
 	saCache := cache.New(
 		*audience,
 		*annotationPrefix,
+		*regionalSTS,
+		*tokenExpiration,
 		clientset,
 	)
 	saCache.Start()
 
 	mod := handler.NewModifier(
+		handler.WithAnnotationDomain(*annotationPrefix),
 		handler.WithExpiration(*tokenExpiration),
 		handler.WithMountPath(*mountPath),
 		handler.WithServiceAccountCache(saCache),
 		handler.WithRegion(*region),
+		handler.WithRegionalSTS(*regionalSTS),
 	)
 
 	addr := fmt.Sprintf(":%d", *port)
@@ -124,21 +134,28 @@ func main() {
 		fmt.Fprintf(w, "ok")
 	})
 
+	// Register debug endpoint only if flag is enabled
+	if *debug {
+		debugger := cachedebug.Dumper{
+			Cache: saCache,
+		}
+		// Reuse metrics port to avoid exposing a new port
+		metricsMux.HandleFunc("/debug/alpha/cache", debugger.Handle)
+		// Expose other debug paths
+	}
 
 	tlsConfig := &tls.Config{}
 
 	if *inCluster {
 		csr := &x509.CertificateRequest{
 			Subject: pkix.Name{CommonName: fmt.Sprintf("%s.%s.svc", *serviceName, *namespaceName)},
+			DNSNames: []string{
+				fmt.Sprintf("%s", *serviceName),
+				fmt.Sprintf("%s.%s", *serviceName, *namespaceName),
+				fmt.Sprintf("%s.%s.svc", *serviceName, *namespaceName),
+				fmt.Sprintf("%s.%s.svc.cluster.local", *serviceName, *namespaceName),
+			},
 			/*
-				// TODO: EKS Signer only allows SANS for ec2-approved domains, once this is fixed
-				// add additional domains and IPs
-				DNSNames: []string{
-					fmt.Sprintf("%s", *serviceName),
-					fmt.Sprintf("%s.%s", *serviceName, *namespaceName),
-					fmt.Sprintf("%s.%s.svc", *serviceName, *namespaceName),
-					fmt.Sprintf("%s.%s.svc.cluster.local", *serviceName, *namespaceName),
-				},
 				// TODO: SANIPs for service IP, but not pod IP
 				//IPAddresses: nil,
 			*/
@@ -180,8 +197,8 @@ func main() {
 	handler.ShutdownOnTerm(server, time.Duration(10)*time.Second)
 
 	metricsServer := &http.Server{
-		Addr:      metricsAddr,
-		Handler:   metricsMux,
+		Addr:    metricsAddr,
+		Handler: metricsMux,
 	}
 
 	go func() {
