@@ -1,6 +1,6 @@
 module github.com/aws/amazon-eks-pod-identity-webhook
 
-go 1.13
+go 1.16
 
 require (
 	github.com/imdario/mergo v0.3.7 // indirect
