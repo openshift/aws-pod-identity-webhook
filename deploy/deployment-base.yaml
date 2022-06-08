@@ -14,10 +14,18 @@ spec:
         app: pod-identity-webhook
     spec:
       serviceAccountName: pod-identity-webhook
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: pod-identity-webhook
         image: IMAGE
         imagePullPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ "ALL" ]
         command:
         - /webhook
         - --in-cluster=false
