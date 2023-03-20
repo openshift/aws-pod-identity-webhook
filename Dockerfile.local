@@ -1,0 +1,8 @@
+FROM registry.access.redhat.com/ubi8/go-toolset:latest AS builder
+WORKDIR /go/src/github.com/aws/amazon-eks-pod-identity-webhook
+COPY . .
+ENV GO_PACKAGE github.com/aws/amazon-eks-pod-identity-webhook
+RUN make amazon-eks-pod-identity-webhook
+
+FROM registry.access.redhat.com/ubi8/ubi-micro
+COPY --from=builder /go/src/github.com/aws/amazon-eks-pod-identity-webhook/amazon-eks-pod-identity-webhook /usr/bin/aws-pod-identity-webhook
