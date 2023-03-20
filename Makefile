@@ -79,6 +79,9 @@ prep-config:
 	cat deploy/deployment-base.yaml | sed -e "s|IMAGE|${IMAGE}|g" | tee deploy/deployment.yaml
 	cat deploy/mutatingwebhook.yaml | hack/webhook-patch-ca-bundle.sh > deploy/mutatingwebhook-ca-bundle.yaml
 
+deploy-aws-local:
+	for file in `ls -1 deploy/aws-pod-identity-webhook`; do kubectl apply -f deploy/aws-pod-identity-webhook/${file}; done
+
 deploy-config: prep-config
 	@echo 'Applying configuration to active cluster...'
 	kubectl apply -f deploy/auth.yaml
@@ -91,6 +94,9 @@ deploy-config: prep-config
 		do echo "Waiting for CSR to be created" && sleep 1 ; \
 	done
 	kubectl certificate approve $$(kubectl get csr -o jsonpath='{.items[?(@.spec.username=="system:serviceaccount:default:pod-identity-webhook")].metadata.name}')
+
+delete-aws-local:
+	for file in `ls -1 deploy/aws-pod-identity-webhook`; do kubectl delete -f deploy/aws-pod-identity-webhook/${file}; done
 
 delete-config:
 	@echo 'Tearing down mutating controller and associated resources...'
