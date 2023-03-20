@@ -45,7 +45,7 @@ spec:
       priorityClassName: system-cluster-critical
       serviceAccountName: pod-identity-webhook
       securityContext:
-        runAsNonRoot: true
+        runAsNonRoot: false
         seccompProfile:
           type: RuntimeDefault
       tolerations:
