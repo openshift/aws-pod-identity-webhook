@@ -15,7 +15,8 @@ spec:
     spec:
       containers:
       - name: pod-identity-webhook
-        image: ${IMAGE}
+#        image: image-registry.openshift-image-registry.svc:5000/default/pod-identity-webhook:0.5
+        image: quay.io/btofel/pod-identity-webhook:0.5
         imagePullPolicy: IfNotPresent
         securityContext:
           allowPrivilegeEscalation: false

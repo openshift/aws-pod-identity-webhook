@@ -17,21 +17,26 @@ endif
 REGISTRY_ID?=602401143452
 IMAGE_NAME?=eks/pod-identity-webhook
 REGION?=us-west-2
-IMAGE?=$(REGISTRY_ID).dkr.ecr.$(REGION).amazonaws.com/$(IMAGE_NAME)
+#IMAGE?=$(REGISTRY_ID).dkr.ecr.$(REGION).amazonaws.com/$(IMAGE_NAME)
+IMAGE_PUSH = default-route-openshift-image-registry.apps-crc.testing/default/pod-identity-webhook:0.5
+IMAGE_PUSH = quay.io/btofel/pod-identity-webhook:0.5
 
 test:
 	go test -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out
 
 docker:
-	@echo 'Building image $(IMAGE)...'
-	docker build --no-cache -t $(IMAGE) .
+	@echo 'Building image $(IMAGE_PUSH)...'
+	docker build --no-cache -t $(IMAGE_PUSH) -f Dockerfile.local .
+
+approve-csr:
+	oc get csr -o name | xargs kubectl certificate approve
 
 push: docker
 	if ! aws ecr get-login-password --region $(REGION) | docker login --username AWS --password-stdin $(REGISTRY_ID).dkr.ecr.$(REGION).amazonaws.com; then \
 	  eval $$(aws ecr get-login --registry-ids $(REGISTRY_ID) --no-include-email); \
 	fi
-	docker push $(IMAGE)
+	docker push $(IMAGE_PUSH)
 
 amazon-eks-pod-identity-webhook:
 	go build
