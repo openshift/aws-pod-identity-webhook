@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: pod-identity-webhook
-  namespace: openshift-cloud-credential-operator
+  namespace: default
 spec:
   replicas: 1
   selector:
@@ -26,7 +26,7 @@ spec:
         - --in-cluster=false
         - --tls-cert=/var/run/app/certs/tls.crt
         - --tls-key=/var/run/app/certs/tls.key
-        - --namespace=openshift-cloud-credential-operator
+        - --namespace=default
         - --port=6443
         - --service-name=pod-identity-webhook
         - --annotation-prefix=eks.amazonaws.com # TODO: use openshift.io based prefix

@@ -9,4 +9,4 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: pod-identity-webhook
-  namespace: openshift-cloud-credential-operator
+  namespace: default
