@@ -147,8 +147,14 @@ func main() {
 	tlsConfig := &tls.Config{}
 
 	if *inCluster {
+		klog.Infof("InCluster is true")
+		subject := &pkix.Name{
+			Organization: []string{"system:nodes"},
+			CommonName:   fmt.Sprintf("system:node:%s.%s.svc", *serviceName, *namespaceName),
+		}
+		klog.Infof("CSR Subject: %s", subject)
 		csr := &x509.CertificateRequest{
-			Subject: pkix.Name{CommonName: fmt.Sprintf("%s.%s.svc", *serviceName, *namespaceName)},
+			Subject: *subject,
 			DNSNames: []string{
 				fmt.Sprintf("%s", *serviceName),
 				fmt.Sprintf("%s.%s", *serviceName, *namespaceName),
@@ -160,6 +166,7 @@ func main() {
 				//IPAddresses: nil,
 			*/
 		}
+		klog.Infof("Created a CSR with common name: %s", fmt.Sprintf("system:node:%s.%s.svc", *serviceName, *namespaceName))
 
 		certManager, err := cert.NewServerCertificateManager(
 			clientset,
