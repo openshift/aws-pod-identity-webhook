@@ -2,7 +2,7 @@ package cache
 
 import (
 	"encoding/json"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"strconv"
 	"sync"
 
@@ -41,7 +41,7 @@ func NewFakeServiceAccountCache(accounts ...*v1.ServiceAccount) *FakeServiceAcco
 var _ ServiceAccountCache = &FakeServiceAccountCache{}
 
 // Start does nothing
-func (f *FakeServiceAccountCache) Start() {}
+func (f *FakeServiceAccountCache) Start(chan struct{}) {}
 
 // Get gets a service account from the cache
 func (f *FakeServiceAccountCache) Get(name, namespace string) (role, aud string, useRegionalSTS bool, tokenExpiration int64) {
@@ -52,6 +52,16 @@ func (f *FakeServiceAccountCache) Get(name, namespace string) (role, aud string,
 		return "", "", false, pkg.DefaultTokenExpiration
 	}
 	return resp.RoleARN, resp.Audience, resp.UseRegionalSTS, resp.TokenExpiration
+}
+
+func (f *FakeServiceAccountCache) GetCommonConfigurations(name, namespace string) (useRegionalSTS bool, tokenExpiration int64) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	resp, ok := f.cache[namespace+"/"+name]
+	if !ok {
+		return false, pkg.DefaultTokenExpiration
+	}
+	return resp.UseRegionalSTS, resp.TokenExpiration
 }
 
 // Add adds a cache entry

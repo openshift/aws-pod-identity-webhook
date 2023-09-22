@@ -64,7 +64,9 @@ func NewServerCertificateManager(kubeClient clientset.Interface, namespace, secr
 			// authenticate itself to a TLS client.
 			certificates.UsageServerAuth,
 		},
-		SignerName:          "kubernetes.io/kubelet-serving",
+		// Hard coding this since LegacyUnknownSignerName is no longer available in certificates/v1
+		// https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/#kubernetes-signers.
+		SignerName:          "kubernetes.io/legacy-unknown",
 		CertificateStore:    certificateStore,
 		CertificateRotation: certificateRotation,
 	})
