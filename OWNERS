@@ -1,7 +1,8 @@
 approvers:
-  - abutcher
   - 2uasimojo
-  - dlom
-  - sjenning
   - suhanime
+  - dlom
+  - jstuever
+  - lleshchi
+  - sjenning
 component: "Cloud Credential Operator"
