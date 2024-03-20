@@ -1,15 +1,17 @@
 module github.com/aws/amazon-eks-pod-identity-webhook
 
-go 1.20
+go 1.21
+
+toolchain go1.21.7
 
 require (
 	github.com/aws/aws-sdk-go v1.44.259
 	github.com/fsnotify/fsnotify v1.5.4
+	github.com/go-jose/go-jose/v4 v4.0.1
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.12.2
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.8.2
-	gopkg.in/square/go-jose.v2 v2.5.1
 	k8s.io/api v0.28.3
 	k8s.io/apimachinery v0.28.3
 	k8s.io/client-go v0.28.3
@@ -47,12 +49,12 @@ require (
 	github.com/prometheus/client_model v0.2.0 // indirect
 	github.com/prometheus/common v0.32.1 // indirect
 	github.com/prometheus/procfs v0.7.3 // indirect
-	golang.org/x/crypto v0.14.0 // indirect
+	golang.org/x/crypto v0.19.0 // indirect
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/oauth2 v0.8.0 // indirect
-	golang.org/x/sys v0.13.0 // indirect
-	golang.org/x/term v0.13.0 // indirect
-	golang.org/x/text v0.13.0 // indirect
+	golang.org/x/sys v0.17.0 // indirect
+	golang.org/x/term v0.17.0 // indirect
+	golang.org/x/text v0.14.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/protobuf v1.30.0 // indirect
