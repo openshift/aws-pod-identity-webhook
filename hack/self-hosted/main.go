@@ -13,7 +13,7 @@ import (
 	"os"
 
 	"github.com/pkg/errors"
-	jose "gopkg.in/square/go-jose.v2"
+	jose "gopkg.in/go-jose/go-jose.v2"
 )
 
 // copied from kubernetes/kubernetes#78502
