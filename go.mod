@@ -9,7 +9,7 @@ require (
 	github.com/prometheus/client_golang v1.12.2
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.8.2
-	gopkg.in/square/go-jose.v2 v2.5.1
+	gopkg.in/go-jose/go-jose.v2 v2.6.3
 	k8s.io/api v0.28.3
 	k8s.io/apimachinery v0.28.3
 	k8s.io/client-go v0.28.3
