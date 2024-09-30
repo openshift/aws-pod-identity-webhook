@@ -19,12 +19,14 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/containercredentials"
 	"io/ioutil"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/containercredentials"
 
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/cache"
@@ -76,6 +78,12 @@ func WithAnnotationDomain(domain string) ModifierOpt {
 	return func(m *Modifier) { m.AnnotationDomain = domain }
 }
 
+// WithSALookupGraceTime sets the grace time to wait for service accounts to appear in cache
+func WithSALookupGraceTime(saLookupGraceTime time.Duration) ModifierOpt {
+	return func(m *Modifier) { m.saLookupGraceTime = saLookupGraceTime }
+
+}
+
 // NewModifier returns a Modifier with default values
 func NewModifier(opts ...ModifierOpt) *Modifier {
 	mod := &Modifier{
@@ -100,6 +108,7 @@ type Modifier struct {
 	ContainerCredentialsConfig containercredentials.Config
 	volName                    string
 	tokenName                  string
+	saLookupGraceTime          time.Duration
 }
 
 type patchOperation struct {
@@ -113,6 +122,9 @@ type podPatchConfig struct {
 	TokenExpiration                 int64
 	UseRegionalSTS                  bool
 	Audience                        string
+	MountPath                       string
+	VolumeName                      string
+	TokenPath                       string
 	WebIdentityPatchConfig          *webIdentityPatchConfig
 	ContainerCredentialsPatchConfig *containercredentials.PatchConfig
 }
@@ -249,16 +261,16 @@ func (m *Modifier) addEnvToContainer(container *corev1.Container, tokenFilePath 
 
 	volExists := false
 	for _, vol := range container.VolumeMounts {
-		if vol.Name == m.volName {
+		if vol.Name == patchConfig.VolumeName {
 			volExists = true
 		}
 	}
 
 	if !volExists {
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-			Name:      m.volName,
+			Name:      patchConfig.VolumeName,
 			ReadOnly:  true,
-			MountPath: m.MountPath,
+			MountPath: patchConfig.MountPath,
 		})
 		changed = true
 	}
@@ -290,7 +302,7 @@ func (m *Modifier) parsePodAnnotations(pod *corev1.Pod, serviceAccountTokenExpir
 
 // getPodSpecPatch gets the patch operation to be applied to the given Pod
 func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, patchConfig *podPatchConfig) ([]patchOperation, bool) {
-	tokenFilePath := filepath.Join(m.MountPath, m.tokenName)
+	tokenFilePath := filepath.Join(patchConfig.MountPath, patchConfig.TokenPath)
 
 	betaNodeSelector, _ := pod.Spec.NodeSelector["beta.kubernetes.io/os"]
 	nodeSelector, _ := pod.Spec.NodeSelector["kubernetes.io/os"]
@@ -326,7 +338,7 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, patchConfig *podPatchConfig)
 	}
 
 	volume := corev1.Volume{
-		Name: m.volName,
+		Name: patchConfig.VolumeName,
 		VolumeSource: corev1.VolumeSource{
 			Projected: &corev1.ProjectedVolumeSource{
 				Sources: []corev1.VolumeProjection{
@@ -334,7 +346,7 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, patchConfig *podPatchConfig)
 						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 							Audience:          patchConfig.Audience,
 							ExpirationSeconds: &patchConfig.TokenExpiration,
-							Path:              m.tokenName,
+							Path:              patchConfig.TokenPath,
 						},
 					},
 				},
@@ -347,7 +359,7 @@ func (m *Modifier) getPodSpecPatch(pod *corev1.Pod, patchConfig *podPatchConfig)
 	// skip adding volume if it already exists
 	volExists := false
 	for _, vol := range pod.Spec.Volumes {
-		if vol.Name == m.volName {
+		if vol.Name == patchConfig.VolumeName {
 			volExists = true
 		}
 	}
@@ -404,26 +416,55 @@ func (m *Modifier) buildPodPatchConfig(pod *corev1.Pod) *podPatchConfig {
 	if containerCredentialsPatchConfig != nil {
 		regionalSTS, tokenExpiration := m.Cache.GetCommonConfigurations(pod.Spec.ServiceAccountName, pod.Namespace)
 		tokenExpiration, containersToSkip := m.parsePodAnnotations(pod, tokenExpiration)
+
+		webhookPodCount.WithLabelValues("container_credentials").Inc()
+
 		return &podPatchConfig{
 			ContainersToSkip:                containersToSkip,
 			TokenExpiration:                 tokenExpiration,
 			UseRegionalSTS:                  regionalSTS,
 			Audience:                        containerCredentialsPatchConfig.Audience,
+			MountPath:                       containerCredentialsPatchConfig.MountPath,
+			VolumeName:                      containerCredentialsPatchConfig.VolumeName,
+			TokenPath:                       containerCredentialsPatchConfig.TokenPath,
 			WebIdentityPatchConfig:          nil,
 			ContainerCredentialsPatchConfig: containerCredentialsPatchConfig,
 		}
 	}
 
 	// Use the STS WebIdentity method if set
-	roleArn, audience, regionalSTS, tokenExpiration := m.Cache.Get(pod.Spec.ServiceAccountName, pod.Namespace)
-	if roleArn != "" {
-		tokenExpiration, containersToSkip := m.parsePodAnnotations(pod, tokenExpiration)
+	request := cache.Request{Namespace: pod.Namespace, Name: pod.Spec.ServiceAccountName, RequestNotification: true}
+	response := m.Cache.Get(request)
+	if !response.FoundInCache && m.saLookupGraceTime > 0 {
+		klog.Warningf("Service account %s not found in the cache. Waiting up to %s to be notified", request.CacheKey(), m.saLookupGraceTime)
+		select {
+		case <-response.Notifier:
+			request = cache.Request{Namespace: pod.Namespace, Name: pod.Spec.ServiceAccountName, RequestNotification: false}
+			response = m.Cache.Get(request)
+			if !response.FoundInCache {
+				klog.Warningf("Service account %s not found in the cache after being notified. Not mutating.", request.CacheKey())
+				return nil
+			}
+		case <-time.After(m.saLookupGraceTime):
+			klog.Warningf("Service account %s not found in the cache after %s. Not mutating.", request.CacheKey(), m.saLookupGraceTime)
+			return nil
+		}
+	}
+	klog.V(5).Infof("Value of roleArn after after cache retrieval for service account %s: %s", request.CacheKey(), response.RoleARN)
+	if response.RoleARN != "" {
+		tokenExpiration, containersToSkip := m.parsePodAnnotations(pod, response.TokenExpiration)
+
+		webhookPodCount.WithLabelValues("sts_web_identity").Inc()
+
 		return &podPatchConfig{
 			ContainersToSkip:                containersToSkip,
 			TokenExpiration:                 tokenExpiration,
-			UseRegionalSTS:                  regionalSTS,
-			Audience:                        audience,
-			WebIdentityPatchConfig:          &webIdentityPatchConfig{RoleArn: roleArn},
+			UseRegionalSTS:                  response.UseRegionalSTS,
+			Audience:                        response.Audience,
+			MountPath:                       m.MountPath,
+			VolumeName:                      m.volName,
+			TokenPath:                       m.tokenName,
+			WebIdentityPatchConfig:          &webIdentityPatchConfig{RoleArn: response.RoleARN},
 			ContainerCredentialsPatchConfig: nil,
 		}
 	}
