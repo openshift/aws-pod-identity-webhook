@@ -21,7 +21,6 @@ import (
 	"crypto/x509/pkix"
 	goflag "flag"
 	"fmt"
-	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/containercredentials"
 	"net/http"
 	"os"
 	"strings"
@@ -31,6 +30,7 @@ import (
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/cache"
 	cachedebug "github.com/aws/amazon-eks-pod-identity-webhook/pkg/cache/debug"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/cert"
+	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/containercredentials"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/handler"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -49,7 +49,7 @@ var webhookVersion = "v0.1.0"
 
 func main() {
 	port := flag.Int("port", 443, "Port to listen on")
-	metricsPort := flag.Int("metrics-port", 9999, "Port to listen on for metrics and healthz (http)")
+	metricsPort := flag.Int("metrics-port", 9999, "Port to listen on for metrics (http)")
 
 	// TODO Group in help text in-cluster/out-of-cluster/business logic flags
 	// out-of-cluster kubeconfig / TLS options
@@ -77,11 +77,16 @@ func main() {
 	composeRoleArn := flag.Bool("compose-role-arn", false, "If true, then the role name and path can be used instead of the fully qualified ARN in the `role-arn` annotation.  In this case, webhook will look up the partition and account ID using instance metadata.  Defaults to `false`.")
 	watchContainerCredentialsConfig := flag.String("watch-container-credentials-config", "", "Absolute path to the container credential config file to watch for")
 	containerCredentialsAudience := flag.String("container-credentials-audience", "pods.eks.amazonaws.com", "The audience for tokens used by the AWS Container Credentials method")
+	containerCredentialsMountPath := flag.String("container-credentials-token-mount-path", "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount", "The path to mount tokens used by the AWS Container Credentials method")
+	containerCredentialsVolumeName := flag.String("container-credentials-token-volume-name", "eks-pod-identity-token", "The name of the projected volume containing the injected service account token. This is only used by the AWS Container Credentials method")
+	containerCredentialsTokenPath := flag.String("container-credentials-token-path", "eks-pod-identity-token", "The path of the injected service account token. This is only used by the AWS Container Credentials method")
 	containerCredentialsFullUri := flag.String("container-credentials-full-uri", "http://169.254.170.23/v1/credentials", "AWS_CONTAINER_CREDENTIALS_FULL_URI will be set to this value in mutated containers")
 
 	version := flag.Bool("version", false, "Display the version and exit")
 
 	debug := flag.Bool("enable-debugging-handlers", false, "Enable debugging handlers. Currently /debug/alpha/cache is supported")
+
+	saLookupGracePeriod := flag.Duration("service-account-lookup-grace-period", 0, "The grace period for service account to be available in cache before not mutating a pod. Defaults to 0, what deactivates waiting. Carefully use values higher than a bunch of milliseconds as it may have significant impact on Kubernetes' pod scheduling performance.")
 
 	klog.InitFlags(goflag.CommandLine)
 	// Add klog CommandLine flags to pflag CommandLine
@@ -185,7 +190,12 @@ func main() {
 	saCache.Start(stop)
 	defer close(stop)
 
-	containerCredentialsConfig := containercredentials.NewFileConfig(*containerCredentialsAudience, *containerCredentialsFullUri)
+	containerCredentialsConfig := containercredentials.NewFileConfig(
+		*containerCredentialsAudience,
+		*containerCredentialsMountPath,
+		*containerCredentialsVolumeName,
+		*containerCredentialsTokenPath,
+		*containerCredentialsFullUri)
 	if watchContainerCredentialsConfig != nil && *watchContainerCredentialsConfig != "" {
 		klog.Infof("Watching container credentials config file %s", *watchContainerCredentialsConfig)
 		err = containerCredentialsConfig.StartWatcher(signalHandlerCtx, *watchContainerCredentialsConfig)
@@ -200,6 +210,7 @@ func main() {
 		handler.WithServiceAccountCache(saCache),
 		handler.WithContainerCredentialsConfig(containerCredentialsConfig),
 		handler.WithRegion(*region),
+		handler.WithSALookupGraceTime(*saLookupGracePeriod),
 	)
 
 	addr := fmt.Sprintf(":%d", *port)
@@ -212,12 +223,12 @@ func main() {
 		handler.Logging(),
 	)
 	mux.Handle("/mutate", baseHandler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "ok")
+	})
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "ok")
-	})
 
 	// Register debug endpoint only if flag is enabled
 	if *debug {
@@ -294,6 +305,8 @@ func main() {
 		Handler: metricsMux,
 	}
 
+	handler.ShutdownFromContext(signalHandlerCtx, metricsServer, time.Duration(10)*time.Second)
+
 	go func() {
 		klog.Infof("Listening on %s", addr)
 		if err := server.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
@@ -301,7 +314,7 @@ func main() {
 		}
 	}()
 
-	klog.Infof("Listening on %s for metrics and healthz", metricsAddr)
+	klog.Infof("Listening on %s for metrics", metricsAddr)
 	if err := metricsServer.ListenAndServe(); err != http.ErrServerClosed {
 		klog.Fatalf("Error listening: %q", err)
 	}
