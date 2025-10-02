@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -85,12 +86,17 @@ func WithSALookupGraceTime(saLookupGraceTime time.Duration) ModifierOpt {
 }
 
 // NewModifier returns a Modifier with default values
-func NewModifier(opts ...ModifierOpt) *Modifier {
+func NewModifier(random *rand.Rand, opts ...ModifierOpt) *Modifier {
+	if random == nil {
+		random = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+
 	mod := &Modifier{
 		AnnotationDomain: "eks.amazonaws.com",
 		MountPath:        "/var/run/secrets/eks.amazonaws.com/serviceaccount",
 		volName:          "aws-iam-token",
 		tokenName:        "token",
+		rand:             *random,
 	}
 	for _, opt := range opts {
 		opt(mod)
@@ -109,6 +115,7 @@ type Modifier struct {
 	volName                    string
 	tokenName                  string
 	saLookupGraceTime          time.Duration
+	rand                       rand.Rand
 }
 
 type patchOperation struct {
@@ -417,6 +424,7 @@ func (m *Modifier) buildPodPatchConfig(pod *corev1.Pod) *podPatchConfig {
 		regionalSTS, tokenExpiration := m.Cache.GetCommonConfigurations(pod.Spec.ServiceAccountName, pod.Namespace)
 		tokenExpiration, containersToSkip := m.parsePodAnnotations(pod, tokenExpiration)
 
+		tokenExpiration = m.addJitterToDefaultToken(tokenExpiration)
 		webhookPodCount.WithLabelValues("container_credentials").Inc()
 
 		return &podPatchConfig{
@@ -433,9 +441,13 @@ func (m *Modifier) buildPodPatchConfig(pod *corev1.Pod) *podPatchConfig {
 	}
 
 	// Use the STS WebIdentity method if set
-	request := cache.Request{Namespace: pod.Namespace, Name: pod.Spec.ServiceAccountName, RequestNotification: true}
+	gracePeriodEnabled := m.saLookupGraceTime > 0
+	request := cache.Request{Namespace: pod.Namespace, Name: pod.Spec.ServiceAccountName, RequestNotification: gracePeriodEnabled}
 	response := m.Cache.Get(request)
-	if !response.FoundInCache && m.saLookupGraceTime > 0 {
+	if !response.FoundInCache && !gracePeriodEnabled {
+		missingSACounter.WithLabelValues().Inc()
+	}
+	if !response.FoundInCache && gracePeriodEnabled {
 		klog.Warningf("Service account %s not found in the cache. Waiting up to %s to be notified", request.CacheKey(), m.saLookupGraceTime)
 		select {
 		case <-response.Notifier:
@@ -443,10 +455,12 @@ func (m *Modifier) buildPodPatchConfig(pod *corev1.Pod) *podPatchConfig {
 			response = m.Cache.Get(request)
 			if !response.FoundInCache {
 				klog.Warningf("Service account %s not found in the cache after being notified. Not mutating.", request.CacheKey())
+				missingSACounter.WithLabelValues().Inc()
 				return nil
 			}
 		case <-time.After(m.saLookupGraceTime):
 			klog.Warningf("Service account %s not found in the cache after %s. Not mutating.", request.CacheKey(), m.saLookupGraceTime)
+			missingSACounter.WithLabelValues().Inc()
 			return nil
 		}
 	}
@@ -471,6 +485,15 @@ func (m *Modifier) buildPodPatchConfig(pod *corev1.Pod) *podPatchConfig {
 
 	// No mutations needed
 	return nil
+}
+
+func (m *Modifier) addJitterToDefaultToken(tokenExpiration int64) int64 {
+	if tokenExpiration == pkg.DefaultTokenExpiration {
+		klog.V(0).Infof("Adding jitter to default token expiration")
+		tokenExpiration = m.rand.Int63n(pkg.DefaultTokenExpiration-pkg.DefaultMinTokenExpiration+int64(1)) + pkg.DefaultMinTokenExpiration
+	}
+
+	return tokenExpiration
 }
 
 // MutatePod takes a AdmissionReview, mutates the pod, and returns an AdmissionResponse

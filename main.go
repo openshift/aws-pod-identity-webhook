@@ -16,11 +16,14 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	goflag "flag"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -32,8 +35,7 @@ import (
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/cert"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/containercredentials"
 	"github.com/aws/amazon-eks-pod-identity-webhook/pkg/handler"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	flag "github.com/spf13/pflag"
 	"k8s.io/client-go/informers"
@@ -46,6 +48,7 @@ import (
 )
 
 var webhookVersion = "v0.1.0"
+var random = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func main() {
 	port := flag.Int("port", 443, "Port to listen on")
@@ -88,6 +91,8 @@ func main() {
 
 	saLookupGracePeriod := flag.Duration("service-account-lookup-grace-period", 0, "The grace period for service account to be available in cache before not mutating a pod. Defaults to 0, what deactivates waiting. Carefully use values higher than a bunch of milliseconds as it may have significant impact on Kubernetes' pod scheduling performance.")
 
+	resyncPeriod := flag.Duration("resync-period", 60*time.Second, "The period to resync the SA informer cache, in seconds.")
+
 	klog.InitFlags(goflag.CommandLine)
 	// Add klog CommandLine flags to pflag CommandLine
 	goflag.CommandLine.VisitAll(func(f *goflag.Flag) {
@@ -118,13 +123,13 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Error creating clientset: %v", err.Error())
 	}
-	informerFactory := informers.NewSharedInformerFactory(clientset, 60*time.Second)
+	informerFactory := informers.NewSharedInformerFactory(clientset, *resyncPeriod)
 
 	var cmInformer v1.ConfigMapInformer
 	var nsInformerFactory informers.SharedInformerFactory
 	if *watchConfigMap {
 		klog.Infof("Watching ConfigMap pod-identity-webhook in %s namespace", *namespaceName)
-		nsInformerFactory = informers.NewSharedInformerFactoryWithOptions(clientset, 60*time.Second, informers.WithNamespace(*namespaceName))
+		nsInformerFactory = informers.NewSharedInformerFactoryWithOptions(clientset, *resyncPeriod, informers.WithNamespace(*namespaceName))
 		cmInformer = nsInformerFactory.Core().V1().ConfigMaps()
 	}
 
@@ -132,20 +137,15 @@ func main() {
 
 	*tokenExpiration = pkg.ValidateMinTokenExpiration(*tokenExpiration)
 
-	var identity ec2metadata.EC2InstanceIdentityDocument
+	var identity imds.InstanceIdentityDocument
 	var composeRoleArnCache cache.ComposeRoleArn
 	if *composeRoleArn {
-		sess, err := session.NewSession()
-		if err != nil {
-			klog.Fatalf("Error creating session: %v", err.Error())
-		}
-
-		metadataClient := ec2metadata.New(sess)
-		identity, err = metadataClient.GetInstanceIdentityDocument()
+		ec2 := imds.New(imds.Options{})
+		getInstanceIdentityDocumentOutput, err := ec2.GetInstanceIdentityDocument(context.Background(), &imds.GetInstanceIdentityDocumentInput{})
 		if err != nil {
 			klog.Fatalf("Error getting instance identity document: %v", err.Error())
 		}
-
+		identity = getInstanceIdentityDocumentOutput.InstanceIdentityDocument
 		region := identity.Region
 		var partition string
 		switch {
@@ -179,6 +179,7 @@ func main() {
 		saInformer,
 		cmInformer,
 		composeRoleArnCache,
+		clientset.CoreV1(),
 	)
 	stop := make(chan struct{})
 	informerFactory.Start(stop)
@@ -205,6 +206,7 @@ func main() {
 	}
 
 	mod := handler.NewModifier(
+		random,
 		handler.WithAnnotationDomain(*annotationPrefix),
 		handler.WithMountPath(*mountPath),
 		handler.WithServiceAccountCache(saCache),
@@ -237,7 +239,18 @@ func main() {
 		}
 		// Reuse metrics port to avoid exposing a new port
 		metricsMux.HandleFunc("/debug/alpha/cache", debugger.Handle)
+		metricsMux.HandleFunc("/debug/alpha/cache/clear", debugger.Clear)
 		// Expose other debug paths
+		mux.Handle("/debug/alpha/deny", handler.Apply(
+			http.HandlerFunc(debugger.Deny),
+			handler.InstrumentRoute(),
+			handler.Logging(),
+		))
+		mux.Handle("/debug/alpha/500", handler.Apply(
+			http.HandlerFunc(debugger.InternalServerError),
+			handler.InstrumentRoute(),
+			handler.Logging(),
+		))
 	}
 
 	tlsConfig := &tls.Config{}
@@ -297,26 +310,45 @@ func main() {
 		Handler:   mux,
 		TLSConfig: tlsConfig,
 	}
-
-	handler.ShutdownFromContext(signalHandlerCtx, server, time.Duration(10)*time.Second)
+	serverDone, serverShutdownError := handler.ShutdownFromContext(signalHandlerCtx, server, time.Duration(10)*time.Second)
 
 	metricsServer := &http.Server{
 		Addr:    metricsAddr,
 		Handler: metricsMux,
 	}
+	metricsServerDone, metricsServerShutdownError := handler.ShutdownFromContext(signalHandlerCtx, metricsServer, time.Duration(10)*time.Second)
 
-	handler.ShutdownFromContext(signalHandlerCtx, metricsServer, time.Duration(10)*time.Second)
-
+	// Start webhook server
 	go func() {
 		klog.Infof("Listening on %s", addr)
-		if err := server.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+		if err := server.ListenAndServeTLS("", ""); !errors.Is(err, http.ErrServerClosed) {
 			klog.Fatalf("Error listening: %q", err)
 		}
 	}()
 
-	klog.Infof("Listening on %s for metrics", metricsAddr)
-	if err := metricsServer.ListenAndServe(); err != http.ErrServerClosed {
-		klog.Fatalf("Error listening: %q", err)
+	// Start metrics server
+	go func() {
+		klog.Infof("Listening on %s for metrics", metricsAddr)
+		if err := metricsServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			klog.Fatalf("Error listening: %q", err)
+		}
+	}()
+
+	klog.Info("Waiting for webhook and metrics servers to shutdown...")
+
+	// Wait for webhook server shutdown
+	<-serverDone
+	if err := <-serverShutdownError; err != nil {
+		klog.Errorf("Webhook server shutdown error: %v", err)
+	} else {
+		klog.Infof("Webhook server shutdown gracefully")
 	}
-	klog.Info("Graceflully closed")
+
+	// Wait for metrics server shutdown
+	<-metricsServerDone
+	if err := <-metricsServerShutdownError; err != nil {
+		klog.Errorf("Metrics server shutdown error: %v", err)
+	} else {
+		klog.Infof("Metrics server shutdown gracefully")
+	}
 }
