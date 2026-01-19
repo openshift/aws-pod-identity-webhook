@@ -24,7 +24,7 @@ GO_IMAGE=public.ecr.aws/eks-distro-build-tooling/golang:$EKSD_GO_IMAGE_TAG-gcc
 # gotoolchain
 # https://go.dev/doc/toolchain
 export GOSUMDB="sum.golang.org"
-export GOTOOLCHAIN=go${GO_VERSION}
+export GOTOOLCHAIN=go${GO_VERSION#v}
 
 # force go modules
 export GO111MODULE=on
