@@ -4,5 +4,5 @@ COPY . .
 ENV GO_PACKAGE github.com/aws/amazon-eks-pod-identity-webhook
 RUN make amazon-eks-pod-identity-webhook
 
-FROM registry.ci.openshift.org/ocp/4.22:base-rhel9
+FROM registry.ci.openshift.org/ocp/4.22:base-rhel9-minimal
 COPY --from=builder /go/src/github.com/aws/amazon-eks-pod-identity-webhook/amazon-eks-pod-identity-webhook /usr/bin/aws-pod-identity-webhook
